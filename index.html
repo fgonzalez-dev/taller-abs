@@ -621,7 +621,7 @@ body {
     </div>
   </div>
   <nav class="nav-tabs">
-    <button class="nav-tab active" onclick="showView('nueva')">+ Nueva Orden</button>
+    <button class="nav-tab active" onclick="irANuevaOrden()">+ Nueva Orden</button>
     <button class="nav-tab" onclick="showView('registros')">Registros</button>
     <button class="nav-tab" onclick="showView('nube')">☁ Nube</button>
   </nav>
@@ -632,7 +632,11 @@ body {
   <!-- ═══ VISTA: NUEVA ORDEN ═══ -->
   <div class="view active" id="view-nueva">
 
-    <div class="section-title">Nueva Orden de Trabajo</div>
+    <div class="section-title" id="form-titulo">Nueva Orden de Trabajo</div>
+    <div id="edit-banner" style="display:none;background:#fff3cd;border:1px solid #f6c453;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#7c5500;display:flex;justify-content:space-between;align-items:center">
+      <span>✎ Estás <strong>editando</strong> la OT <span id="edit-banner-num"></span>. Las fotos existentes se conservan; las nuevas que agregues se sumarán.</span>
+      <button class="btn btn-outline btn-sm" onclick="cancelarEdicion()">Cancelar edición</button>
+    </div>
 
     <!-- DATOS DEL VEHÍCULO -->
     <div class="card">
@@ -786,7 +790,7 @@ body {
 
     <!-- BOTONES FINALES -->
     <div class="btn-row">
-      <button class="btn btn-primary" onclick="guardarOrden()">💾 Guardar Orden</button>
+      <button class="btn btn-primary" id="btn-guardar-ot" onclick="guardarOrden()">💾 Guardar Orden</button>
       <button class="btn btn-outline" onclick="limpiarForm()">🗑 Limpiar</button>
     </div>
 
@@ -1531,6 +1535,19 @@ function showView(v) {
   if (v === 'registros') { renderTabla(); updateStats(); }
 }
 
+// Click en la pestaña "+ Nueva Orden" desde el menú: si estaba editando,
+// preguntar si quiere descartar; si no, limpiar y empezar OT nueva.
+function irANuevaOrden() {
+  if (editandoId != null) {
+    if (!confirm('Estás editando una OT. ¿Descartar los cambios y empezar una OT nueva?')) {
+      showView('nueva');
+      return;
+    }
+    cancelarEdicion();
+  }
+  showView('nueva');
+}
+
 // ═══ MÓDULOS ═══
 function toggleMod(label) {
   setTimeout(() => {
@@ -1541,6 +1558,8 @@ function toggleMod(label) {
 
 // ═══ FOTOS ═══
 let fotos = [];
+// ID de la OT actualmente en edición (null = creando una nueva)
+let editandoId = null;
 let lightboxIdx = 0;
 let lightboxFotos = [];
 
@@ -1712,8 +1731,9 @@ async function guardarOrden() {
   document.querySelectorAll('#modulos-container input:checked').forEach(cb => modulos.push(cb.value));
 
   const fotosCopia = JSON.parse(JSON.stringify(fotos));
-  const orden = {
-    id: contadorOT++,
+
+  // Datos editables comunes a crear y actualizar
+  const datos = {
     fecha: document.getElementById('f-fecha').value || new Date().toISOString().split('T')[0],
     patente,
     marca,
@@ -1732,13 +1752,44 @@ async function guardarOrden() {
     diagnostico: document.getElementById('f-diagnostico').value,
     informe: document.getElementById('f-informe').value,
     alumno: document.getElementById('f-alumno').value,
-    repuestos: JSON.parse(JSON.stringify(repuestos)),
-    // Las fotos NO se guardan en el DB. Se guardan en IndexedDB y se referencian por id.
-    fotos: [],
+    repuestos: JSON.parse(JSON.stringify(repuestos))
+  };
+
+  if (editandoId != null) {
+    // ───────── MODO EDICIÓN ─────────
+    const orden = DB.find(x => x.id === editandoId);
+    if (!orden) {
+      showToast('No se encontró la OT a editar', true);
+      cancelarEdicion();
+      return;
+    }
+    Object.assign(orden, datos);
+    orden.fotos = [];
+    orden.fotosCount = fotosCopia.length;
+    orden.modificado = new Date().toISOString();
+    // Reescribir fotos en IndexedDB (las que tenga ahora la edición)
+    try { await savePhotosForOT(orden.id, fotosCopia); }
+    catch(e) { console.warn('No se pudieron guardar fotos localmente:', e); }
+
+    saveDB();
+    enviarADrive('editada', orden);
+    localStorage.removeItem('tallerABP_borrador');
+    const numStr = orden.id.toString().padStart(4,'0');
+    showToast('✔ OT-' + numStr + ' actualizada');
+    cancelarEdicion();
+    setTimeout(() => showView('registros'), 600);
+    return;
+  }
+
+  // ───────── MODO CREACIÓN ─────────
+  const orden = Object.assign({
+    id: contadorOT++,
+  }, datos, {
+    fotos: [],            // las fotos NO se guardan en DB; van a IndexedDB
     fotosCount: fotosCopia.length,
     estado: 'ingresado',
     creado: new Date().toISOString()
-  };
+  });
 
   // 1) Guardar fotos en IndexedDB (local) ANTES de saveDB para que la cache esté lista
   if (fotosCopia.length > 0) {
@@ -1755,6 +1806,70 @@ async function guardarOrden() {
   setTimeout(() => showView('registros'), 900);
 }
 
+// ═══ EDICIÓN DE OT ═══
+function editarOrden(id) {
+  const o = DB.find(x => x.id === id);
+  if (!o) { showToast('OT no encontrada', true); return; }
+
+  // Cargar datos en el formulario
+  document.getElementById('f-patente').value      = o.patente || '';
+  document.getElementById('f-marca').value        = o.marca || '';
+  document.getElementById('f-modelo').value       = o.modelo || '';
+  document.getElementById('f-anio').value         = o.anio || '';
+  document.getElementById('f-color').value        = o.color || '';
+  document.getElementById('f-km').value           = o.km || '';
+  document.getElementById('f-serie').value        = o.serie || '';
+  document.getElementById('f-motor').value        = o.motor || '';
+  document.getElementById('f-fecha').value        = o.fecha || new Date().toISOString().split('T')[0];
+  document.getElementById('f-nombre').value       = o.nombre || '';
+  document.getElementById('f-domicilio').value    = o.domicilio || '';
+  document.getElementById('f-fono').value         = o.fono || '';
+  document.getElementById('f-correo').value       = o.correo || '';
+  document.getElementById('f-observaciones').value= o.observaciones || '';
+  document.getElementById('f-diagnostico').value  = o.diagnostico || '';
+  document.getElementById('f-informe').value      = o.informe || '';
+  document.getElementById('f-alumno').value       = o.alumno || '';
+
+  // Módulos
+  const mods = o.modulos || [];
+  document.querySelectorAll('#modulos-container input').forEach(cb => {
+    cb.checked = mods.includes(cb.value);
+    const label = cb.closest('.modulo-check');
+    if (label) label.classList.toggle('checked', cb.checked);
+  });
+
+  // Repuestos
+  repuestos = (o.repuestos || []).map(r => Object.assign({}, r));
+  renderRepuestos();
+
+  // Fotos: copiar las existentes desde IndexedDB a la variable de trabajo
+  fotos = (getPhotosFor(o.id) || []).map(f => Object.assign({}, f));
+  renderFotos();
+
+  // Activar modo edición
+  editandoId = o.id;
+  const numStr = 'OT-' + o.id.toString().padStart(4,'0');
+  document.getElementById('form-titulo').textContent = 'Editando ' + numStr;
+  document.getElementById('edit-banner-num').textContent = numStr;
+  document.getElementById('edit-banner').style.display = 'flex';
+  const btn = document.getElementById('btn-guardar-ot');
+  if (btn) btn.innerHTML = '💾 Actualizar OT';
+
+  // Cerrar el modal de detalle si está abierto
+  cerrarDetalleDirecto();
+  showView('nueva');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function cancelarEdicion() {
+  editandoId = null;
+  document.getElementById('form-titulo').textContent = 'Nueva Orden de Trabajo';
+  document.getElementById('edit-banner').style.display = 'none';
+  const btn = document.getElementById('btn-guardar-ot');
+  if (btn) btn.innerHTML = '💾 Guardar Orden';
+  limpiarForm();
+}
+
 function limpiarForm() {
   ['f-patente','f-marca','f-modelo','f-anio','f-color','f-km','f-serie','f-motor',
    'f-nombre','f-domicilio','f-fono','f-correo','f-observaciones','f-diagnostico','f-informe','f-alumno'].forEach(id => {
@@ -1767,6 +1882,14 @@ function limpiarForm() {
   renderRepuestos();
   fotos = [];
   renderFotos();
+  // Salir del modo edición si lo estaba
+  editandoId = null;
+  const t  = document.getElementById('form-titulo');
+  const bn = document.getElementById('edit-banner');
+  const bt = document.getElementById('btn-guardar-ot');
+  if (t)  t.textContent = 'Nueva Orden de Trabajo';
+  if (bn) bn.style.display = 'none';
+  if (bt) bt.innerHTML = '💾 Guardar Orden';
 }
 
 // ═══ TABLA REGISTROS ═══
@@ -1816,6 +1939,7 @@ function renderTabla(filteredList) {
       <td>
         <div class="btn-row" style="margin:0;gap:6px">
           <button class="btn btn-outline btn-sm" onclick="verDetalle(${o.id})">Ver</button>
+          <button class="btn btn-success btn-sm" onclick="editarOrden(${o.id})">✎ Editar</button>
           <button class="btn btn-amber btn-sm" onclick="imprimirOrden(${o.id})">Imprimir</button>
           <button class="btn btn-primary btn-sm" onclick="exportarFicha(${o.id})">⬇ Ficha</button>
           ${o.fono ? `<button class="btn btn-success btn-sm" onclick="enviarWhatsapp('${o.fono}','${o.patente}','${o.marca} ${o.modelo}')">💬</button>` : ''}
@@ -1919,6 +2043,7 @@ function verDetalle(id) {
     ${bloqueImagenes(getPhotosFor(o.id), o.id)}
     <div style="margin-bottom:12px"><div class="card-title">Cotización de repuestos</div>${repHtml}</div>
     <div class="btn-row" style="margin-top:16px">
+      <button class="btn btn-success" onclick="editarOrden(${o.id})">✎ Editar OT</button>
       <button class="btn btn-amber" onclick="imprimirOrden(${o.id})">🖨 Imprimir</button>
       <button class="btn btn-primary" onclick="exportarFicha(${o.id})">⬇ Exportar ficha</button>
       ${o.fono ? `<button class="btn btn-success" onclick="enviarWhatsapp('${o.fono}','${o.patente}','${o.marca} ${o.modelo}')">💬 WhatsApp</button>` : ''}
